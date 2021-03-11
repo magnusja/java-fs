@@ -23,6 +23,7 @@ package org.jnode.fs.ntfs;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -93,7 +94,7 @@ public class FileRecord extends NTFSRecord {
      * @param offset          offset into the buffer.
      */
     public FileRecord(NTFSVolume volume, long referenceNumber, byte[] buffer, int offset) throws IOException {
-        this(volume, volume.getBootRecord().getBytesPerSector(), volume.getClusterSize(), true, referenceNumber,
+        this(volume, volume.getClusterSize(), true, referenceNumber,
             buffer, offset);
     }
 
@@ -101,26 +102,20 @@ public class FileRecord extends NTFSRecord {
      * Initialize this instance.
      *
      * @param volume          reference to the NTFS volume.
-     * @param bytesPerSector  the number of bytes-per-sector in this volume.
      * @param clusterSize     the cluster size for the volume containing this record.
      * @param strictFixUp     indicates whether an exception should be throw if fix-up values don't match.
      * @param referenceNumber the reference number of the file within the MFT.
      * @param buffer          data buffer.
      * @param offset          offset into the buffer.
      */
-    public FileRecord(NTFSVolume volume, int bytesPerSector, int clusterSize, boolean strictFixUp, long referenceNumber,
+    public FileRecord(NTFSVolume volume, int clusterSize, boolean strictFixUp, long referenceNumber,
                       byte[] buffer, int offset) throws IOException {
 
-        super(bytesPerSector, strictFixUp, buffer, offset);
+        super(strictFixUp, buffer, offset);
 
         this.volume = volume;
         this.clusterSize = clusterSize;
         this.referenceNumber = referenceNumber;
-
-        storedAttributeList = readStoredAttributes();
-
-        // Linux NTFS docs say there can only be one of these, so I'll believe them.
-        attributeListAttribute = (AttributeListAttribute) findStoredAttributeByType(NTFSAttribute.Types.ATTRIBUTE_LIST);
     }
 
     /**
@@ -129,20 +124,22 @@ public class FileRecord extends NTFSRecord {
      * @throws IOException if an error occurs.
      */
     public void checkIfValid() throws IOException {
-        // check for the magic number to see if we have a filerecord
+        // check for the magic number to see if we have a file record
         if (getMagic() != Magic.FILE) {
-            log.debug("Invalid magic number found for FILE record: " + getMagic() + " -- dumping buffer");
-            for (int off = 0; off < getBuffer().length; off += 32) {
-                StringBuilder builder = new StringBuilder();
-                for (int i = off; i < off + 32 && i < getBuffer().length; i++) {
-                    String hex = Integer.toHexString(getBuffer()[i]);
-                    while (hex.length() < 2) {
-                        hex = '0' + hex;
-                    }
+            if (log.isDebugEnabled()) {
+                log.debug("Invalid magic number found for FILE record: " + getMagic() + " -- dumping buffer");
+                for (int off = 0; off < getBuffer().length; off += 32) {
+                    StringBuilder builder = new StringBuilder();
+                    for (int i = off; i < off + 32 && i < getBuffer().length; i++) {
+                        String hex = Integer.toHexString(getBuffer()[i]);
+                        while (hex.length() < 2) {
+                            hex = '0' + hex;
+                        }
 
-                    builder.append(' ').append(hex);
+                        builder.append(' ').append(hex);
+                    }
+                    log.debug(builder.toString());
                 }
-                log.debug(builder.toString());
             }
 
             throw new IOException("Invalid magic found: " + getMagic());
@@ -359,6 +356,9 @@ public class FileRecord extends NTFSRecord {
      * @return an iterator over attributes stored in this file record.
      */
     public List<NTFSAttribute> getAllStoredAttributes() {
+        if (storedAttributeList == null) {
+            storedAttributeList = readStoredAttributes();
+        }
         return storedAttributeList;
     }
 
@@ -369,7 +369,7 @@ public class FileRecord extends NTFSRecord {
      * @return the attribute found, or {@code null} if not found.
      */
     private NTFSAttribute findStoredAttributeByID(int id) {
-        for (NTFSAttribute attr : storedAttributeList) {
+        for (NTFSAttribute attr : getAllStoredAttributes()) {
             if (attr != null && attr.getAttributeID() == id) {
                 return attr;
             }
@@ -385,12 +385,27 @@ public class FileRecord extends NTFSRecord {
      * @see NTFSAttribute.Types
      */
     private NTFSAttribute findStoredAttributeByType(int typeID) {
-        for (NTFSAttribute attr : storedAttributeList) {
+        for (NTFSAttribute attr : getAllStoredAttributes()) {
             if (attr != null && attr.getAttributeType() == typeID) {
                 return attr;
             }
         }
         return null;
+    }
+
+    /**
+     * Gets the attributes list attribute, if the record has one.
+     *
+     * @return the attribute, or {@code null}.
+     */
+    public AttributeListAttribute getAttributeListAttribute() {
+        if (attributeListAttribute == null) {
+            // Linux NTFS docs say there can only be one of these, so I'll believe them.
+            attributeListAttribute =
+                (AttributeListAttribute) findStoredAttributeByType(NTFSAttribute.Types.ATTRIBUTE_LIST);
+        }
+
+        return attributeListAttribute;
     }
 
     /**
@@ -402,15 +417,27 @@ public class FileRecord extends NTFSRecord {
     public synchronized List<NTFSAttribute> getAllAttributes() {
         if (attributeList == null) {
             try {
-                if (attributeListAttribute == null) {
+                if (getAttributeListAttribute() == null) {
                     log.debug("All attributes stored");
                     attributeList = new ArrayList<NTFSAttribute>(getAllStoredAttributes());
                 } else {
                     log.debug("Attributes in attribute list");
-                    readAttributeListAttributes();
+                    attributeList = readAttributeListAttributes(new FileRecordSupplier() {
+                        @Override
+                        public FileRecord getRecord(long referenceNumber) throws IOException {
+                            // When reading the MFT itself don't attempt to check the index is in range
+                            // (we won't know the total MFT length yet)
+                            MasterFileTable mft = getVolume().getMFT();
+                            return getReferenceNumber() == MasterFileTable.SystemFiles.MFT
+                                ? mft.getRecordUnchecked(referenceNumber)
+                                : mft.getRecord(referenceNumber);
+                        }
+                    });
                 }
             } catch (Exception e) {
-                log.error("Error getting attributes for entry: " + this, e);
+                log.error("Error getting attributes for file record: " + referenceNumber +
+                    ", returning stored attributes", e);
+                attributeList = new ArrayList<NTFSAttribute>(getAllStoredAttributes());
             }
         }
 
@@ -649,24 +676,47 @@ public class FileRecord extends NTFSRecord {
 
     @Override
     public String toString() {
+        String fileName = null;
+
+        try {
+            // Only look at stored attributes to determine the file name to avoid a possible stack overflow
+            for (NTFSAttribute attribute : getAllStoredAttributes()) {
+                if (attribute.getAttributeType() == NTFSAttribute.Types.FILE_NAME) {
+                    FileNameAttribute fileNameAttribute = (FileNameAttribute) attribute;
+                    if (fileName == null || fileNameAttribute.getNameSpace() == FileNameAttribute.NameSpace.WIN32) {
+                        fileName = fileNameAttribute.getFileName();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Error getting file name for file record: " + referenceNumber, e);
+        }
+
         if (isInUse()) {
-            return String.format("FileRecord [%d fileName='%s']", referenceNumber, getFileName());
+            return String.format("FileRecord [%d name='%s']", referenceNumber, fileName);
         } else {
-            return String.format("FileRecord [%d unused]", referenceNumber);
+            return String.format("FileRecord [%d unused name='%s']", referenceNumber, fileName);
         }
     }
 
     /**
      * Reads in all attributes referenced by the attribute-list attribute.
+     *
+     * @param recordSupplier the FILE record supplier.
+     * @return the list of attributes.
      */
-    private synchronized void readAttributeListAttributes() {
+    private List<NTFSAttribute> readAttributeListAttributes(FileRecordSupplier recordSupplier) {
         Iterator<AttributeListEntry> entryIterator;
 
         try {
+            AttributeListAttribute attributeListAttribute = getAttributeListAttribute();
+            if (attributeListAttribute == null) {
+                return Collections.emptyList();
+            }
             entryIterator = attributeListAttribute.getAllEntries();
         } catch (Exception e) {
-            throw new IllegalStateException("Error getting attributes from attribute list, file record " +
-                FileRecord.this, e);
+            throw new IllegalStateException("Error getting attributes from attribute list, file record: " +
+                referenceNumber, e);
         }
 
         AttributeListBuilder attributeListBuilder = new AttributeListBuilder();
@@ -682,22 +732,28 @@ public class FileRecord extends NTFSRecord {
                     attribute = findStoredAttributeByID(entry.getAttributeID());
                     attributeListBuilder.add(attribute);
                 } else {
-                    log.debug("Looking up MFT entry for: " + entry.getFileReferenceNumber());
+                    if (entry.getFileReferenceNumber() == 0) {
+                        log.debug("Skipping lookup for entry: " + entry);
+                        continue;
+                    }
 
-                    // When reading the MFT itself don't attempt to check the index is in range (we won't know the total
-                    // MFT length yet)
-                    MasterFileTable mft = getVolume().getMFT();
-                    FileRecord holdingRecord = getReferenceNumber() == MasterFileTable.SystemFiles.MFT
-                        ? mft.getRecordUnchecked(entry.getFileReferenceNumber())
-                        : mft.getRecord(entry.getFileReferenceNumber());
+                    if (log.isDebugEnabled()) {
+                        log.debug("Looking up MFT entry for: " + entry.getFileReferenceNumber());
+                    }
 
-                    attribute = holdingRecord.findStoredAttributeByID(entry.getAttributeID());
-
-                    if (attribute == null) {
-                        log.error(String.format("Failed to find an attribute matching entry '%s' in the holding record",
+                    FileRecord holdingRecord = recordSupplier.getRecord(entry.getFileReferenceNumber());
+                    if (holdingRecord == null) {
+                        log.error(String.format("Failed to look up holding record %d for entry '%s'", referenceNumber,
                             entry));
                     } else {
-                        attributeListBuilder.add(attribute);
+                        attribute = holdingRecord.findStoredAttributeByID(entry.getAttributeID());
+
+                        if (attribute == null) {
+                            log.error(String.format("Failed to find an attribute matching entry '%s' in the holding " +
+                                    "record, ref=%d", entry, referenceNumber));
+                        } else {
+                            attributeListBuilder.add(attribute);
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -706,7 +762,7 @@ public class FileRecord extends NTFSRecord {
             }
         }
 
-        attributeList = attributeListBuilder.toList();
+        return attributeListBuilder.toList();
     }
 
     /**
